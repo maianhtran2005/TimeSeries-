@@ -5,7 +5,7 @@ output:
     df_print: paged
 ---
 
-### **Cài đặt thư viện**
+### Cài đặt thư viện
 
 ```{r}
 install.packages("tidyverse")
@@ -40,7 +40,9 @@ library(tseries)
 library(forecast)
 ```
 
-### **Lấy dữ liệu đầu vào**
+### Phần 1: Làm sạch và định dạng dữ liệu
+
+**Lấy dữ liệu đầu vào**
 
 ```{r}
 df_raw <- read.csv("E:/dataScience/Year_3_Documents/phantichchuoithoigian/TimeSeries-/Steel_industry_data.csv", stringsAsFactors = FALSE, fileEncoding = "UTF-8-BOM")
@@ -53,7 +55,7 @@ cat("\nKiểu dữ liệu:\n"); print(sapply(df_raw, class))
 cat("\nThống kê mô tả:\n"); print(summary(df_raw))
 ```
 
-### Chuyển đổi cột thời gian
+**Chuyển đổi Timestamp sang kiểu số nguyên datetime**
 
 ```{r}
 df <- df_raw %>%
@@ -61,18 +63,21 @@ df <- df_raw %>%
     datetime = dmy_hm(date),) %>%
   arrange(datetime)
  
-cat("\nKhoảng thời gian:\n")
 cat("  Bắt đầu:", format(min(df$datetime), "%d/%m/%Y %H:%M"), "\n")
 cat("  Kết thúc:", format(max(df$datetime), "%d/%m/%Y %H:%M"), "\n")
 ```
 
-### Kiểm tra tính liên tục
+**Kiểm tra tính liên tục**
+
+Kiểm tra thời gian chia đều đúng khoảng cách 15', so sánh độ dài dữ liệu thực.
+
+Nếu trường hợp thiếu -\> chèn thêm hàng mới với giá trị NaN và vị trí thiếu
 
 ```{r}
 time_diffs <- diff(df$datetime)  # đơn vị: phút
 irregular <- which(as.numeric(time_diffs, units = "mins") != 15)
  
-cat("\nSố khoảng thời gian không đều (≠ 15 phút):", length(irregular), "\n")
+cat("\nSố khoảng thời gian không đều (!= 15 phút):", length(irregular), "\n")
 if (length(irregular) > 0) {
   cat("Các vị trí bất thường:\n")
   print(df[irregular, c("datetime")])
@@ -80,110 +85,121 @@ if (length(irregular) > 0) {
 
 ```
 
-### Tạo chuỗi thời gian đầy đủ & điểm khuyết
+**Tạo chuỗi thời gian đầy đủ & điểm khuyết**
+
+Tại thời điểm t, biến thay đổi tuyến tính giữa 2 điểm lân cận:
+
+$$\hat{x}_t = x_{t-1} + \frac{x_{t+1} - x_{t-1}}{2}$$
 
 ```{r}
-full_seq <- seq(min(df$datetime), max(df$datetime), by = "15 min")
-full_df  <- data.frame(datetime = full_seq)
- 
-df_complete <- full_df %>%
-  left_join(df, by = "datetime")
- 
-n_missing <- sum(is.na(df_complete$Usage_kWh))
-cat("\nSố dòng bị khuyết sau khi tạo chuỗi đầy đủ:", n_missing, "\n")
+df_complete <- df %>%
+  # 1. Đảm bảo chuỗi thời gian liên tục mỗi 15 phút
+  complete(datetime = seq(min(datetime), max(datetime), by = "15 min")) %>%
+  
+  # 2. Điền khuyết (nội suy) cho TẤT CẢ các cột dạng số (numeric)
+  mutate(across(where(is.numeric), ~na.approx(., na.rm = FALSE, rule = 2))) %>%
+  
+  # 3. Điền khuyết (lấy giá trị liền trước) cho các cột phân loại
+  fill(WeekStatus, Day_of_week, Load_Type, .direction = "down")
 
-#Với các biến số liên tục
-numeric_cols <- c("Usage_kWh", "Lagging_Current_Reactive.Power_kVarh","Leading_Current_Reactive_Power_kVarh","CO2.tCO2.", "Lagging_Current_Power_Factor","Leading_Current_Power_Factor", "NSM")
- 
-df_complete[numeric_cols] <- lapply(df_complete[numeric_cols], function(x) {
-  na.approx(x, na.rm = FALSE, rule = 2)  # rule=2: điền đầu/cuối bằng giá trị gần nhất
-})
-
-#Điển khuyết biến phân loại bằng giá trị liền trước
-cat_cols <- c("WeekStatus", "Day_of_week", "Load_Type")
-df_complete[cat_cols] <- lapply(df_complete[cat_cols], na.locf, na.rm = FALSE)
- 
-cat("Sau điền khuyết - Số NA còn lại:", sum(is.na(df_complete$Usage_kWh)), "\n")
+# Kiểm tra lại số lượng NA
+cat("Số NA sau điền khuyết:", sum(is.na(df_complete$Usage_kWh)), "\n")
 ```
 
-### **Xử lý Outliers**
+**Xử lý Outliers**
+
+Đo độ rộng của 50% dữ liệu ở giữa:
+
+$$
+IQR = Q_3 - Q_1
+$$
+
+Ngưỡng phát hiện bất thường:
+
+$$
+Lower = Q_1 -k * IQR
+$$
+
+$$
+Upper = Q_3 + k * IQR
+$$
 
 ```{r}
-# Khởi tạo list lưu vết outlier trước khi xử lý
-outlier_log <- list()
-
-# 1. Hàm phát hiện và sửa outlier bằng IQR ± k
+# 1. Hàm IQR tối ưu: Gọn gàng hơn, loại bỏ mảng toàn cục, báo cáo trực tiếp
 fix_iqr_outlier <- function(x, col_name, k = 3) {
   Q1 <- quantile(x, 0.25, na.rm = TRUE)
   Q3 <- quantile(x, 0.75, na.rm = TRUE)
-  IQR <- Q3 - Q1
-  lo <- Q1 - k * IQR
-  hi <- Q3 + k * IQR
-  idx <- which(x < lo | x > hi)
   
-  if (length(idx) > 0) {
-    x_fixed <- x
-    x_fixed[idx] <- NA
-    
-    # Dùng na.approx với rule=2 để nội suy an toàn cả ở 2 đầu mảng
-    x_fixed <- zoo::na.approx(x_fixed, na.rm = FALSE, rule = 2)
-    x_fixed <- zoo::na.locf(zoo::na.locf(x_fixed, na.rm = FALSE), fromLast = TRUE, na.rm = FALSE)
-    
-    message(sprintf("   [IQR ±%g] %-38s | ngưỡng [%.2f, %.2f] | %d điểm", k, col_name, lo, hi, length(idx)))
-    outlier_log[[col_name]] <<- list(col = col_name, method = paste0("IQR ±", k), lower = lo, upper = hi, n = length(idx), action = "interpolate")
-    return(x_fixed)
+  lo <- Q1 - k * (Q3 - Q1)
+  hi <- Q3 + k * (Q3 - Q1)
+  
+  outliers <- x < lo | x > hi
+  n_outliers <- sum(outliers, na.rm = TRUE)
+  
+  if (n_outliers > 0) {
+    x[outliers] <- NA
+    # Chỉ cần rule = 2 đủ để xử lý cả 2 đầu mảng
+    x <- na.approx(x, na.rm = FALSE, rule = 2) 
+    message(sprintf("Đã xử lý: %-38s | %d điểm outliers (IQR ±%g)", col_name, n_outliers, k))
   }
   return(x)
 }
 
-# 2. Xử lý giá trị âm vô lý (Sử dụng df_complete và tên cột gốc)
-neg_check_cols <- c("Usage_kWh", "Lagging_Current_Reactive.Power_kVarh", "Leading_Current_Reactive_Power_kVarh", "CO2.tCO2.")
-for(col in neg_check_cols) {
-  n_neg <- sum(df_complete[[col]] < 0, na.rm = TRUE)
-  if (n_neg > 0) {
-    df_complete[[col]] <- pmax(df_complete[[col]], 0)
-    outlier_log[[paste0(col, "_neg")]] <- list(col = col, method = "clip âm", n = n_neg, action = "clip")
-  }
-}
-
-# 3. Xử lý Power factor ngoài khoảng [0,100]
-for(col in c("Lagging_Current_Power_Factor", "Leading_Current_Power_Factor")) {
-  n_bad <- sum(df_complete[[col]] < 0 | df_complete[[col]] > 100, na.rm = TRUE)
-  if(n_bad > 0) {
-    df_complete[[col]] <- pmin(pmax(df_complete[[col]], 0), 100)
-    outlier_log[[paste0(col, "_pf")]] <- list(col = col, method = "clip [0,100]", n = n_bad, action = "clip")
-  }
-}
-
-# 4. IQR spike detection
-df_complete <- df_complete %>% 
-  mutate(
-    Usage_kWh = fix_iqr_outlier(Usage_kWh, "Usage_kWh", k = 3), 
-    Lagging_Current_Reactive.Power_kVarh = fix_iqr_outlier(Lagging_Current_Reactive.Power_kVarh, "Lagging_Current_Reactive.Power_kVarh", k = 3),
-    Leading_Current_Reactive_Power_kVarh = fix_iqr_outlier(Leading_Current_Reactive_Power_kVarh, "Leading_Current_Reactive_Power_kVarh", k = 3),
-    Lagging_Current_Power_Factor = fix_iqr_outlier(Lagging_Current_Power_Factor, "Lagging_Current_Power_Factor", k = 3),
-    Leading_Current_Power_Factor = fix_iqr_outlier(Leading_Current_Power_Factor, "Leading_Current_Power_Factor", k = 3)
-  )
-
-# 5. Tóm tắt outlier log
-if (length(outlier_log) == 0) {
-  cat("Không phát hiện outlier nào cần xử lý.\n")
-} else {
-  cat(sprintf("\nTổng cộng %d nhóm outlier đã được xử lý.\n", length(outlier_log)))
-}
+# 2. Pipeline xử lý Outliers đồng loạt
+df_complete <- df_complete %>%
+  
+  # a. Giới hạn các giá trị không được phép âm (cắt về 0)
+  mutate(across(c(Usage_kWh, Lagging_Current_Reactive.Power_kVarh, 
+          Leading_Current_Reactive_Power_kVarh, CO2.tCO2.), 
+                ~ pmax(., 0))) %>%
+  
+  # b. Giới hạn Power Factor trong khoảng [0, 100]
+  mutate(across(ends_with("Power_Factor"), 
+                ~ pmin(pmax(., 0), 100))) %>%
+  
+  # c. Xử lý đột biến (Spikes) bằng hàm fix_iqr_outlier ở trên
+  mutate(across(c(Usage_kWh, Lagging_Current_Reactive.Power_kVarh, 
+                  Leading_Current_Reactive_Power_kVarh, 
+                  ends_with("Power_Factor")),
+                ~ fix_iqr_outlier(., cur_column(), k = 3)))
 ```
 
-### **EDA & Phân tích mùa vụ**
+### Phần 2: EDA & Phân tích mùa vụ
+
+Dữ liệu thô:
+
+-   Công suất (Ceiling): Các đỉnh nhọn liên tục chạm mức \~150-160 kWh. Đây là mức tiêu thụ điện năng khi tất cả các dây chuyền, máy móc hoạt động 100% công suất tải
+
+-   Mức chạy nền (Floor): Biên dưới dải xanh luôn bám sát trục 0 là lượng điện tiêu thụ khi nhà máy nghỉ, duy trì hệ thống làm mát, chiếu sáng.
+
+    -\> Sự chênh lệch này cho thấy mức độ tiêu hao năng lượng khổng lồ của ngành công nghiệp nặng mỗi khi khởi động máy móc.
+
+    \
+    Xu hướng:
+
+-   Khoảng tháng 2 có một đường giảm xuống sâu nhất -\> đây là thời gian nghỉ lễ, giảm thiểu tối đa khoảng 1-2 tuần.
+
+-   Giai đoạn ổn định từ tháng 3 - tháng 5 và từ tháng 9 - tháng 11 duy trì ở mức cao và đi ngang -\> đây là lúc máy móc chạy full công suất các ngày trong tuần
+
+-   Giai đoạn lên xuống thất thường. Giai đoạn này có thể sụt giảm đơn hàng ngắn hạn hoặc nhà máy bảo trì luân phiên các lò luyện
+
+-   Xu hướng lao dốc rõ rệt vào cuối năm -\> Phản ánh kỳ nghỉ lễ và thời điểm chốt sổ sách, xả kho hạn chế sản xuất mới.
 
 ```{r}
 #Biểu đồ tổng quan chuỗi thời gian
 p_overview <- ggplot(df_clean, aes(x = datetime, y = Usage_kWh)) + 
   geom_line(color = "#2196F3", linewidth = 0.3, alpha = 0.7) +
-  geom_smooth(color = "#FF5722", se = FALSE, linewidth = 1, method = "loess", span = 0.05) + 
-  labs(title = "Tiêu thụ điện năng theo thời gian (2018)",subtitle = "Đường xanh: dữ liệu thô | Đường cam: xu hướng (LOESS)",x = "Thời gian", y = "Usage (kWh)") + scale_x_datetime(date_breaks = "1 month", date_labels = "%b") + 
+
+  geom_smooth(method = "gam", formula = y ~ s(x, bs = "cs"), 
+              color = "#FF5722", se = FALSE, linewidth = 1) + 
+  labs(title = "Tiêu thụ điện năng theo thời gian (2018)",
+       subtitle = "Đường xanh: dữ liệu thô | Đường cam: xu hướng",
+       x = "Thời gian", y = "Usage (kWh)") + 
+  scale_x_datetime(date_breaks = "1 month", date_labels = "%b") + 
   theme_minimal(base_size = 12) + 
   theme(plot.title = element_text(face = "bold"))
-p_overview
+
+print(p_overview)
 ```
 
 ```{r}
@@ -191,80 +207,137 @@ p_overview
 #dùng mf = 96
 usage_ts <- ts(df_clean$Usage_kWh, frequency = 96)
 stl_fit <- stl(usage_ts, s.window = "periodic", robust = TRUE)
+
+# Gom kết quả vào dataframe
 stl_df <- data.frame(
   datetime = df_clean$datetime,
-  observed = as.numeric(stl_fit$time.series[, "remainder"] +
-                            stl_fit$time.series[, "seasonal"] +
-                            stl_fit$time.series[, "trend"]),
-  trend = as.numeric(stl_fit$time.series[, "trend"]),
-  seasonal = as.numeric(stl_fit$time.series[, "seasonal"]),
-  residual = as.numeric(stl_fit$time.series[, "remainder"])
+  Observed = as.numeric(usage_ts),
+  Trend    = as.numeric(stl_fit$time.series[, "trend"]),
+  Seasonal = as.numeric(stl_fit$time.series[, "seasonal"]),
+  Residual = as.numeric(stl_fit$time.series[, "remainder"])
 )
-p_trend    <- ggplot(stl_df, aes(x = datetime, y = trend)) +
-  geom_line(color = "#E91E63", linewidth = 0.5) +
-  labs(title = "Xu hướng (Trend)", x = NULL, y = "kWh") + theme_minimal()
-p_trend 
+
+# Xoay dọc dữ liệu để vẽ facet bằng 1 lệnh duy nhất
+stl_long <- stl_df %>%
+  pivot_longer(cols = -datetime, names_to = "Component", values_to = "Value") %>%
+  # Ép kiểu factor để giữ đúng thứ tự sắp xếp từ trên xuống dưới
+  mutate(Component = factor(Component, levels = c("Observed", "Trend", "Seasonal", "Residual")))
+
+# Vẽ toàn bộ 4 biểu đồ xếp chồng
+p_stl <- ggplot(stl_long, aes(x = datetime, y = Value, color = Component)) +
+  geom_line(linewidth = 0.4, alpha = 0.8) +
+  facet_wrap(~Component, scales = "free_y", ncol = 1) + # Cắt làm 4 dòng
+  scale_color_manual(values = c("Observed"="#2196F3", "Trend"="#E91E63", 
+                                "Seasonal"="#4CAF50", "Residual"="#9E9E9E")) +
+  scale_x_datetime(date_breaks = "2 months", date_labels = "%b") +
+  labs(title = "Phân rã chuỗi thời gian", x = NULL, y = NULL) + 
+  theme_minimal(base_size = 11) +
+  theme(legend.position = "none", 
+        strip.text = element_text(face = "bold", size = 10, hjust = 0))
+
+print(p_stl)
 
 ```
 
+Phân tích biểu đồ:
+
+-   Biểu đồ Xu hướng (Trend): Phản ánh giai đoạn tăng vọt mùa cao điểm và những điểm võng xuống sâu có thể trùng với các kỳ nghỉ lễ dài ngày.
+
+-   Biểu đồ Mùa vụ (Seasonality):
+
+    -   Theo chu kỳ tuần: Cứ 5 khối cao (đại diện cho từ T2-T6), trong đó có những khối tụt giảm mạnh biên độ (đại diện cho T7-CN).
+
+    -   Theo chu kỳ ngày: Trong 1 ngày làm việc, biên độ cao, các khung giờ lò luyện hoạt động với công suất tối đa. Biên độ chạm đáy khi thời gian vào ban đêm, giao ca hoặc giờ nghỉ khi chỉ còn điện chiếu sáng và hệ thống chạy nền hoạt động
+
+-   Biểu đồ Nhiễu (Residual): Phần dữ liệu còn sót lại khi đã trừ đi xu hướng chung và mùa vụ lặp lại. Đại diện cho những sự cố bất thường xảy ra: do ép ca chạy bù tiến độ, khởi động lại lò hoặc máy móc bị lỗi rò rỉ công suất
+
 ```{r}
+# 1. Biểu đồ Trend (Cả năm)
+p_trend <- ggplot(stl_df, aes(x = datetime, y = Trend)) +
+  geom_line(color = "#E91E63", linewidth = 0.6) +
+  scale_x_datetime(date_breaks = "2 months", date_labels = "%b") +
+  labs(title = "Xu hướng (Trend)", x = NULL, y = "kWh") + 
+  theme_minimal() +
+  theme(plot.title = element_text(face = "bold"))
+
+# 2. Biểu đồ Mùa vụ (Zoom 14 ngày để thấy rõ chu kỳ)
 p_seasonal <- ggplot(stl_df %>% filter(datetime < min(datetime) + days(14)),
-                     aes(x = datetime, y = seasonal)) +
-  geom_line(color = "#4CAF50", linewidth = 0.6) +
+                     aes(x = datetime, y = Seasonal)) +
+  geom_line(color = "#4CAF50", linewidth = 0.8) +
+  scale_x_datetime(date_breaks = "2 days", date_labels = "%d/%m") + # Sửa format ngày cho dễ nhìn
   labs(title = "Mùa vụ – 2 tuần đầu (Seasonality)", x = NULL, y = "kWh") +
-  theme_minimal()
-p_seasonal
-```
+  theme_minimal() +
+  theme(plot.title = element_text(face = "bold"))
 
-```{r}
-p_residual <- ggplot(stl_df, aes(x = datetime, y = residual)) +
+# 3. Biểu đồ Nhiễu (Cả năm)
+p_residual <- ggplot(stl_df, aes(x = datetime, y = Residual)) +
   geom_line(color = "#9C27B0", linewidth = 0.3, alpha = 0.6) +
   geom_hline(yintercept = 0, color = "red", linetype = "dashed") +
+  scale_x_datetime(date_breaks = "2 months", date_labels = "%b") +
   labs(title = "Nhiễu (Residual)", x = "Thời gian", y = "kWh") +
-  theme_minimal()
-p_residual
-```
+  theme_minimal() +
+  theme(plot.title = element_text(face = "bold"))
 
-```{r}
+# 4. Ghép nối bằng Patchwork
 p_decomp <- p_trend / p_seasonal / p_residual +
-  plot_annotation(title = "STL Decomposition – Tiêu thụ điện (Steel Industry)",
-                  theme = theme(plot.title = element_text(face = "bold", size = 14)))
-p_decomp
+  plot_annotation(
+    title = "STL Decomposition – Tiêu thụ điện (Steel Industry)",
+    theme = theme(plot.title = element_text(face = "bold", size = 16, hjust = 0.5))
+  )
+
+# Hiển thị kết quả
+print(p_decomp)
 ```
 
+Từ biểu đồ ta có thể thấy nhà máy chạy công suất tối đa 2 ca: sáng (8h-11h) và tối (18h - 20h)
+
 ```{r}
-#Phân tích theo giờ
+# 1. Trích xuất đặc trưng
 df_clean <- df_clean %>%
   mutate(
     hour      = hour(datetime),
-    weekday   = wday(datetime, label = TRUE, abbr = FALSE, locale = "C"),
+    weekday   = wday(datetime, label = TRUE, abbr = FALSE, locale = "C", week_start = 1),
     month_num = month(datetime),
     month_lab = month(datetime, label = TRUE, abbr = TRUE)
   )
-#Trung bình theo giờ
-hourly_avg <- df_clean %>%
+
+# 2. Tính trung bình giờ & Vẽ biểu đồ
+p_hourly <- df_clean %>%
   group_by(hour) %>%
-  summarise(mean_kWh = mean(Usage_kWh, na.rm = TRUE), .groups = "drop")
-hourly_avg
-p_hourly <- ggplot(hourly_avg, aes(x = hour, y = mean_kWh)) +
+  summarise(mean_kWh = mean(Usage_kWh, na.rm = TRUE), .groups = "drop") %>%
+  
+  # Đưa thẳng data vào ggplot không cần tạo biến trung gian hourly_avg
+  ggplot(aes(x = hour, y = mean_kWh)) +
   geom_col(fill = "#1565C0", alpha = 0.85) +
   geom_line(color = "#FF6F00", linewidth = 1) +
   geom_point(color = "#FF6F00", size = 2) +
-  annotate("rect", xmin = 7.5, xmax = 11.5, ymin = -Inf, ymax = Inf,
-           fill = "red", alpha = 0.08) +
-  annotate("rect", xmin = 17.5, xmax = 20.5, ymin = -Inf, ymax = Inf,
-           fill = "red", alpha = 0.08) +
-  annotate("text", x = 9.5, y = max(hourly_avg$mean_kWh) * 0.97,
-           label = "Cao điểm\nSáng", size = 3, color = "red") +
-  annotate("text", x = 19, y = max(hourly_avg$mean_kWh) * 0.97,
-           label = "Cao điểm\nTối", size = 3, color = "red") +
+  
+  #Truyền vector c() vào hàm annotate -> vẽ 2 HCN cùng lúc
+  annotate("rect", xmin = c(7.5, 17.5), xmax = c(11.5, 20.5), 
+           ymin = -Inf, ymax = Inf, fill = "red", alpha = 0.08) +
+  
+  # in 2 dòng chữ text bằng một lệnh duy nhất
+  annotate("text", x = c(9.5, 19), y = max(df_clean$Usage_kWh, na.rm = TRUE) * 0.45, 
+           label = c("Cao điểm\nSáng", "Cao điểm\nTối"), size = 3.5, color = "red", fontface = "bold") +
   scale_x_continuous(breaks = 0:23) +
   labs(title = "Tiêu thụ điện trung bình theo giờ trong ngày",
        x = "Giờ (0–23)", y = "Mean Usage (kWh)") +
   theme_minimal(base_size = 12) +
-  theme(plot.title = element_text(face = "bold"))
-p_hourly
+  theme(
+    plot.title = element_text(face = "bold", hjust = 0.5), 
+    panel.grid.minor = element_blank() # Xóa các vạch lưới phụ cho đồ thị sạch hơn
+  )
+
+print(p_hourly)
 ```
+
+Phân tích trung bình theo ngày trong tuần:
+
+-   Từ thứ 2 - thứ 6: mức tiêu thụ điện trung bình vươn lên mốc cao nhất và duy trì đồng đều quanh ngưỡng \~35 kWh cho mỗi khối 15'
+
+-   Thứ 7 sụt giảm đột ngột chỉ còn một nửa mức tiêu thụ so với các ngày trong tuần
+
+-   Chủ nhật: mức tiêu thụ chạm đáy ở mức rất thấp -\> đây là ngày nghỉ của nhà máy nên lượng điện tiêu thụ chủ yếu là thiết bị làm mát, đèn chiếu sáng ...
 
 ```{r}
 #Trung bình theo ngày trong tuần
@@ -283,6 +356,14 @@ p_dow <- ggplot(dow_avg, aes(x = weekday, y = mean_kWh,
         axis.text.x = element_text(angle = 30, hjust = 1))
 p_dow
 ```
+
+Trung bình tiêu thụ điện theo tháng trong 1 năm:
+
+-   Mùa cao điểm (từ t1-t5 và t9-t11): nhu cầu sản lượng tăng cao, nhà máy phải hoạt động hết công suất liên tục nhiều ngày trong tuần
+
+-   Mùa trung bình (t6-t8): có sự sụt giảm nhẹ do sự biến động về nhu cầu vật liệu thép chững lại và yếu tố ngoại cảnh (nắng nóng, lượng điện dân dụng sử dụng tăng cao nên các nhà máy công nghiệp nặng được khuyến khích giảm tải sản xuất để tránh sập nguồn lưới điện)
+
+-   Mùa thấp điểm (t2,t12): giai đoạn này lượng điện tiêu thụ trung bình thấp do nghỉ lễ và là thời điểm cuối năm, công ty chốt sổ sách giải phóng hàng tồn kho và hạn chế sản xuất sản phẩm mới
 
 ```{r}
 #Trung bình theo tháng
@@ -304,6 +385,8 @@ p_monthly
 
 ```
 
+#### Tổng kết lại:
+
 ```{r}
 p_eda_combined <- (p_hourly | p_dow) / p_monthly +
   plot_annotation(title = "EDA – Phân tích mùa vụ",
@@ -317,11 +400,19 @@ p_eda_combined
 #2 tuần
 n_lags <- 96*7*2
 acf_vals <- acf(df_clean$Usage_kWh, lag.max = n_lags, plot = FALSE)
+acf_vals
+
 pacf_vals <- pacf(df_clean$Usage_kWh, lag.max = n_lags, plot = FALSE)
+pacf_vals
+
 #chuyển sang data frame để vẽ ggplot
 acf_df <- data.frame(lag = acf_vals$lag[-1], acf = acf_vals$acf[-1])
+acf_df
+
 pacf_df <- data.frame(lag = pacf_vals$lag, pacf = pacf_vals$acf)
 ci_95 <- qnorm(0.975) / sqrt(nrow(df_clean)) #ngưỡng ý nghĩa 95%
+pacf_df
+
 #đánh dấu các lag 
 key_lags <- c(4, 96,96*7) #1h, 1ngay, 1 tuan
 
@@ -361,31 +452,109 @@ p_pacf <- ggplot(pacf_df, aes(x = lag, y = pacf)) +
 p_pacf
 ```
 
+Nhận xét:
+
+-   Lag_desc: Thời gian, hoàn cảnh đang ca nào, ngày nào
+
+-   Lag_steps: Lịch trình, lịch sử lặp lại
+
+    -    Ngắn hạn (Lag_1): 15' trước lò luyện thép không bật/tắt trong 1 giây. Nếu 15' trước xưởng đang tiêu thụ 100 kWh thì 15' tới khả năng cao vẫn xoay quanh mức đó
+
+    <!-- -->
+
+    -   Trung hạn (Lag_96): đúng giờ này hôm qua dùng bao nhiêu điện, hôm nay dùng cỡ đó.
+
+    -   Dài hạn (Lag_672): đúng giờ này tuần trước
+
+-   ACF_value: Quán tính đang trên đà tăng hay giảm từ đó xác định được xưởng có đang trên đà ép ca hay không nó sẽ dự đoán 15' tiếp theo sẽ tiếp tục cao
+
 ```{r}
 #Phân tích lag quan trọng
-important_lags <- data.frame(Lag_steps = c(1,2,4,8,48,96,192,96*5,96*7),
-                             Lag_desc = c("15 phút", "30 phút", "1 giờ", "2 giờ","12 giờ", "1 ngày", "2 ngày", "5 ngày", "1 tuần"),
-                             ACF_value = round(acf_vals$acf[c(2,3,5,9,49,97,193,96*5+1, 96*7+1)], 4))
+important_lags <- data.frame(Lag_steps = c(1,2,4,8,48,96,192,96*5,96*7), Lag_desc = c("15 phút", "30 phút", "1 giờ", "2 giờ","12 giờ", "1 ngày", "2 ngày", "5 ngày", "1 tuần"), ACF_value = round(acf_vals$acf[c(2,3,5,9,49,97,193,96*5+1, 96*7+1)], 4))
 print(important_lags)
 #Ưu tiên các lag [1,4,96,672] tương ứng với [15',1h,1 ngày, 1 tuần]
 ```
 
-```{r}
+### Phần 3: Feature engineering
 
+```{r}
+df_model_ready <- df_clean %>%
+  # Sắp xếp thời gian là BẮT BUỘC trước khi Lag/Rolling
+  arrange(datetime) %>% 
+  mutate(
+    Hour          = hour(datetime),
+    Day_of_Week   = wday(datetime, week_start = 1),
+    Week_of_Year  = isoweek(datetime),
+    Month         = month(datetime),
+    
+    Hour_sin      = sin(2 * pi * Hour / 24),
+    Hour_cos      = cos(2 * pi * Hour / 24),
+    
+    Peak_Flag = case_when(
+      Hour >= 8  & Hour < 12 ~ "Morning_Peak",
+      Hour >= 18 & Hour < 22 ~ "Evening_Peak",
+      Hour >= 0  & Hour < 5  ~ "Off_Peak_Night",
+      TRUE                   ~ "Normal"
+    ),
+    Is_Peak = ifelse(Peak_Flag %in% c("Morning_Peak", "Evening_Peak"), 1L, 0L),
+    
+    Is_Weekend    = ifelse(Day_of_Week >= 6, 1L, 0L),
+    
+    KR_Holidays_2018 = as.integer(as.Date(datetime) %in% as.Date(c(
+      "2018-01-01", "2018-02-15", "2018-02-16", "2018-02-17", 
+      "2018-03-01", "2018-05-05", "2018-05-07", "2018-06-06", 
+      "2018-08-15", "2018-09-23", "2018-09-24", "2018-09-25", 
+      "2018-09-26", "2018-10-03", "2018-10-09", "2018-12-25"
+    ))),
+    
+    Is_Holiday = pmax(Is_Weekend, KR_Holidays_2018),
+    
+    # Lag features (Các giá trị quá khứ đã chốt)
+    lag_1        = lag(Usage_kWh, 1),
+    lag_2        = lag(Usage_kWh, 2), # Cần lag_2 để tính delta
+    lag_4        = lag(Usage_kWh, 4),
+    lag_96       = lag(Usage_kWh, 96),
+    lag_672      = lag(Usage_kWh, 672),
+    
+    # Rolling (BẮT BUỘC phải bọc thêm lag(..., 1) để tránh Data Leakage)
+    roll_mean_4  = lag(rollmeanr(Usage_kWh, k = 4, fill = NA), 1),
+    roll_mean_96 = lag(rollmeanr(Usage_kWh, k = 96, fill = NA), 1),
+    roll_sd_4    = lag(rollapply(Usage_kWh, width = 4, FUN = sd, fill = NA, align = "right"), 1),
+    
+    # Rate of change (Chỉ được dùng quá khứ trừ quá khứ)
+    delta_1      = lag_1 - lag_2,
+    delta_4      = lag_1 - lag_4
+  ) %>%
+  
+  # Cắt bỏ 672 dòng đầu tiên (chứa NA do lấy Lag 1 tuần)
+  drop_na() %>%
+  
+  # Lọc BỎ các cột gây nhiễu, rò rỉ hoặc dư thừa trước khi đưa vào ML
+  select(
+    -date, -KR_Holidays_2018, -Peak_Flag, # Các cột text/trung gian
+    -CO2.tCO2., -Load_Type, -Lagging_Current_Reactive.Power_kVarh, # Cột gây rò rỉ dữ liệu (Xảy ra đồng thời)
+    -Leading_Current_Reactive_Power_kVarh, -Lagging_Current_Power_Factor, -Leading_Current_Power_Factor, -NSM, -WeekStatus, -Day_of_week
+  )
+
+# Kiểm tra dữ liệu đã sạch sẽ hoàn toàn
+str(df_model_ready)
 ```
 
 ```{r}
-
+# Thống kê feature
+cat("\nPhân phối Peak_Flag:\n"); print(table(df_model_ready$Peak_Flag))
+cat("\nPhân phối Is_Holiday:\n"); print(table(df_model_ready$Is_Holiday))
+cat("\nPhân phối Is_Weekend:\n"); print(table(df_model_ready$Is_Weekend))
+cat("\nPhân phối Load_Type_num:\n"); print(table(df_model_ready$Load_Type_num))
 ```
 
 ```{r}
+split_index <- floor(nrow(df_model_ready) * 0.8)
 
-```
+df_train <- df_model_ready[1:split_index, ]
+df_test  <- df_model_ready[(split_index + 1):nrow(df_model_ready), ]
 
-```{r}
-
-```
-
-```{r}
-
+# Lưu ra 2 file riêng biệt
+write_csv(df_train, "Train_Steel_Data.csv")
+write_csv(df_test, "Test_Steel_Data.csv")
 ```
