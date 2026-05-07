@@ -458,7 +458,7 @@ Nhận xét:
 
 -   Lag_steps: Lịch trình, lịch sử lặp lại
 
-    -    Ngắn hạn (Lag_1): 15' trước lò luyện thép không bật/tắt trong 1 giây. Nếu 15' trước xưởng đang tiêu thụ 100 kWh thì 15' tới khả năng cao vẫn xoay quanh mức đó
+    -   Ngắn hạn (Lag_1): 15' trước lò luyện thép không bật/tắt trong 1 giây. Nếu 15' trước xưởng đang tiêu thụ 100 kWh thì 15' tới khả năng cao vẫn xoay quanh mức đó
 
     <!-- -->
 
@@ -514,7 +514,7 @@ df_model_ready <- df_clean %>%
     lag_2        = lag(Usage_kWh, 2), # Cần lag_2 để tính delta
     lag_4        = lag(Usage_kWh, 4),
     lag_96       = lag(Usage_kWh, 96),
-    lag_672      = lag(Usage_kWh, 672),
+    lag_97      = lag(Usage_kWh, 97),
     
     # Rolling (BẮT BUỘC phải bọc thêm lag(..., 1) để tránh Data Leakage)
     roll_mean_4  = lag(rollmeanr(Usage_kWh, k = 4, fill = NA), 1),
@@ -523,7 +523,7 @@ df_model_ready <- df_clean %>%
     
     # Rate of change (Chỉ được dùng quá khứ trừ quá khứ)
     delta_1      = lag_1 - lag_2,
-    delta_4      = lag_1 - lag_4
+    delta_4      = lag_1 - lag_97,
   ) %>%
   
   # Cắt bỏ 672 dòng đầu tiên (chứa NA do lấy Lag 1 tuần)
@@ -546,6 +546,14 @@ cat("\nPhân phối Peak_Flag:\n"); print(table(df_model_ready$Peak_Flag))
 cat("\nPhân phối Is_Holiday:\n"); print(table(df_model_ready$Is_Holiday))
 cat("\nPhân phối Is_Weekend:\n"); print(table(df_model_ready$Is_Weekend))
 cat("\nPhân phối Load_Type_num:\n"); print(table(df_model_ready$Load_Type_num))
+```
+
+```{r}
+library(tseries)
+# Chạy kiểm định Dickey-Fuller trên cột Usage_kWh
+adf_result_raw <- adf.test(df_clean$Usage_kWh, alternative = "stationary")
+print(adf_result_raw)
+# p-value < 0.05 => Dữ liệu dừng hoàn toàn.
 ```
 
 ```{r}
